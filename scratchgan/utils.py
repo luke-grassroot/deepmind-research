@@ -19,10 +19,12 @@ from __future__ import print_function
 import math
 import os
 from absl import logging
+
 import numpy as np
-import tensorflow.compat.v1 as tf
+import tensorflow as tf
 from tensorflow.compat.v1.io import gfile
-from scratchgan import reader
+
+import reader
 
 EVAL_FILENAME = "evaluated_checkpoints.csv"
 GLOVE_DIM = 300
@@ -93,13 +95,13 @@ def get_position_signal(sequence_length, position_dim=8):
   """
   # Compute the frequencies.
   periods = tf.exp(
-      tf.lin_space(
-          tf.log(2.0), tf.log(tf.to_float(sequence_length)), position_dim))
+      tf.linspace(
+          tf.math.log(2.0), tf.math.log(tf.cast(sequence_length, tf.float32)), position_dim))
   frequencies = 1.0 / periods  # Shape [T, P].
 
   # Compute the sine waves.
-  xs = frequencies[None, :] * tf.to_float(tf.range(sequence_length)[:, None])
-  shifts = tf.lin_space(0.0, 2.0, position_dim)[None, :]  # [1, P]
+  xs = frequencies[None, :] * tf.cast(tf.range(sequence_length)[:, None], tf.float32)
+  shifts = tf.linspace(0.0, 2.0, position_dim)[None, :]  # [1, P]
   positions = tf.math.cos(math.pi * (xs + shifts))  # [T, P]
   positions.shape.assert_is_compatible_with([sequence_length, position_dim])
   return positions
@@ -127,7 +129,7 @@ def get_mask_by_length(lengths, max_length):
 
 def get_mask_past_symbol(reference, symbol, optimize_for_tpu=False):
   """For each row, mask is True before and at the first occurrence of symbol."""
-  batch_size, max_length = reference.get_shape().as_list()
+  batch_size, max_length = reference.shape if tf.executing_eagerly() else reference.get_shape().as_list()
   symbol = tf.convert_to_tensor(symbol)
   symbol.shape.assert_is_compatible_with([])
 
@@ -182,7 +184,7 @@ def get_first_occurrence_indices(reference, symbol, optimize_for_tpu=False):
         reverse=True)
     return min_indexes[0]
 
-  batch_size, max_length = reference.get_shape().as_list()
+  batch_size, max_length = reference.shape if tf.executing_eagerly() else reference.get_shape().as_list()
   symbol = tf.convert_to_tensor(symbol)
   symbol.shape.assert_is_compatible_with([])
   # Add symbol at the end of each row, to make sure tf.where works.
@@ -195,17 +197,21 @@ def get_first_occurrence_indices(reference, symbol, optimize_for_tpu=False):
   # several `symbol` in one row of tensor. We need to take only the position
   # of the first occurrence for each row. `segment_min` does that, taking the
   # lowest column index for each row index.
-  index_first_occurrences = tf.segment_min(index_all_occurrences[:, 1],
+  index_first_occurrences = tf.math.segment_min(index_all_occurrences[:, 1],
                                            index_all_occurrences[:, 0])
   index_first_occurrences.set_shape([batch_size])
   index_first_occurrences = tf.minimum(index_first_occurrences + 1, max_length)
   return index_first_occurrences
 
+def log_gen_sequence(gen_outputs, id_to_word, prefix="Output sentence: "):
+    gen_sequence_np = gen_outputs["sequence"]
+    logging.info(f"{prefix}{sequence_to_sentence(gen_sequence_np[0, :], id_to_word)}")
 
 def sequence_to_sentence(sequence, id_to_word):
   """Turn a sequence into a sentence , inverse of sentence_to_sequence."""
   words = []
-  for token_index in sequence:
+  sequence_nd = sequence.numpy()
+  for token_index in sequence_nd:
     if token_index in id_to_word:
       words.append(id_to_word[token_index])
     else:
@@ -215,6 +221,12 @@ def sequence_to_sentence(sequence, id_to_word):
 
 def batch_sequences_to_sentences(sequences, id_to_word):
   return [sequence_to_sentence(sequence, id_to_word) for sequence in sequences]
+
+
+def log_gradients(writer, vars, grads, step):
+  with writer.as_default():
+    for i, var in enumerate(vars):
+      tf.summary.histogram(f'grad/{var.name}', grads[i], step=step)
 
 
 def write_eval_results(checkpoint_dir, all_gen_sentences, checkpoint_name,
@@ -301,14 +313,13 @@ def make_partially_trainable_embeddings(vocab_file, embedding_source,
       vocab_file=vocab_file,
       embedding_source=embedding_source,
       vocab_size=vocab_size)
-  pretrained_embedding = tf.get_variable(
-      "pretrained_embedding",
-      initializer=embedding_initializer,
+  pretrained_embedding = tf.Variable(
+      embedding_initializer,
+      name="pretrained_embedding",
       dtype=tf.float32)
-  trainable_embedding = tf.get_variable(
-      "trainable_embedding",
-      shape=[vocab_size, trainable_embedding_size],
-      initializer=tf.initializers.random_normal(mean=0.0, stddev=GLOVE_STD))
+  trainable_embedding = tf.Variable(
+      tf.random.normal(shape=[vocab_size, trainable_embedding_size], mean=0.0, stddev=GLOVE_STD),
+      name="trainable_embedding")
   # We just concatenate embeddings, they will pass through a projection
   # matrix afterwards.
   embedding = tf.concat([pretrained_embedding, trainable_embedding], axis=1)

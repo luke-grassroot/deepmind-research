@@ -17,11 +17,45 @@ from __future__ import division
 from __future__ import print_function
 
 import sonnet as snt
-import tensorflow.compat.v1 as tf
-from scratchgan import utils
+import tensorflow as tf
+import utils
 
+class LSTMWithLayerNorm(snt.LSTM):
+  """An LSTM layer with layer norm"""
 
-class LSTMEmbedDiscNet(snt.AbstractModule):
+  def __init__(self, hidden_size: int, use_layer_norm: False):
+    super(LSTMWithLayerNorm, self).__init__(hidden_size)
+    self._use_layer_norm = use_layer_norm
+    if use_layer_norm:
+      self.layer_norm = snt.LayerNorm(axis=slice(1, None), create_scale=True, create_offset=True)
+
+  def __call__(self, inputs, prev_state):
+    self._initialize(inputs)
+    #     return _lstm_fn(inputs, prev_state, self._w_i, self._w_h, self.b,
+                    # self.projection)
+
+    gates_x = tf.matmul(inputs, self._w_i)
+    gates_h = tf.matmul(prev_state.hidden, self._w_h)
+
+    gates = gates_x + gates_h
+    if self._use_layer_norm:
+      gates = self.layer_norm(gates)
+    
+    gates += self.b
+
+    # i = input, f = forget, g = cell updates, o = output.
+    i, f, g, o = tf.split(gates, num_or_size_splits=4, axis=1)
+
+    next_cell = tf.sigmoid(f) * prev_state.cell
+    next_cell += tf.sigmoid(i) * tf.tanh(g)
+    next_hidden = tf.sigmoid(o) * tf.tanh(next_cell)
+
+    if self.projection is not None:
+      next_hidden = tf.matmul(next_hidden, self.projection)
+
+    return next_hidden, snt.LSTMState(hidden=next_hidden, cell=next_cell)
+
+class LSTMEmbedDiscNet(snt.Module):
   """An LSTM discriminator that operates on word indexes."""
 
   def __init__(self,
@@ -46,7 +80,31 @@ class LSTMEmbedDiscNet(snt.AbstractModule):
     if self._embedding_source:
       assert vocab_file
 
-  def _build(self, sequence, sequence_length, is_training=True):
+    if self._embedding_source:
+      self.all_embeddings = utils.make_partially_trainable_embeddings(
+          self._vocab_file, self._embedding_source, self._vocab_size,
+          self._trainable_embedding_size)
+    else:
+      self.all_embeddings = tf.get_variable(
+          'trainable_embedding',
+          shape=[self._vocab_size, self._trainable_embedding_size],
+          trainable=True)
+
+    _, self._embedding_size = self.all_embeddings.shape.as_list()
+
+    self.input_fcn = snt.Linear(self._feature_sizes[0])    
+    
+    encoder_cells = []
+    for feature_size in self._feature_sizes:
+      encoder_cells += [
+          LSTMWithLayerNorm(feature_size, use_layer_norm=self._use_layer_norm)
+      ]
+    self.encoder_cell = snt.DeepRNN(encoder_cells)
+
+    self.batch_final = snt.BatchApply(snt.Linear(1))
+
+
+  def __call__(self, sequence, sequence_length, is_training=True):
     """Connect to the graph.
 
     Args:
@@ -60,53 +118,45 @@ class LSTMEmbedDiscNet(snt.AbstractModule):
       each sequence in the batch, the features should (hopefully) allow to
       distinguish if the value at each timestep is real or generated.
     """
-    batch_size, max_sequence_length = sequence.shape.as_list()
+    batch_size, max_sequence_length = sequence.shape if tf.executing_eagerly() else sequence.shape.as_list()
     keep_prob = (1.0 - self._dropout) if is_training else 1.0
 
-    if self._embedding_source:
-      all_embeddings = utils.make_partially_trainable_embeddings(
-          self._vocab_file, self._embedding_source, self._vocab_size,
-          self._trainable_embedding_size)
-    else:
-      all_embeddings = tf.get_variable(
-          'trainable_embedding',
-          shape=[self._vocab_size, self._trainable_embedding_size],
-          trainable=True)
-    _, self._embedding_size = all_embeddings.shape.as_list()
-    input_embeddings = tf.nn.dropout(all_embeddings, keep_prob=keep_prob)
+    input_embeddings = tf.nn.dropout(self.all_embeddings, 1 - keep_prob)
     embeddings = tf.nn.embedding_lookup(input_embeddings, sequence)
+    
     embeddings.shape.assert_is_compatible_with(
         [batch_size, max_sequence_length, self._embedding_size])
+    
     position_dim = 8
     embeddings_pos = utils.append_position_signal(embeddings, position_dim)
+
     embeddings_pos = tf.reshape(
         embeddings_pos,
         [batch_size * max_sequence_length, self._embedding_size + position_dim])
-    lstm_inputs = snt.Linear(self._feature_sizes[0])(embeddings_pos)
+
+    lstm_inputs = self.input_fcn(embeddings_pos)
     lstm_inputs = tf.reshape(
         lstm_inputs, [batch_size, max_sequence_length, self._feature_sizes[0]])
     lstm_inputs.shape.assert_is_compatible_with(
         [batch_size, max_sequence_length, self._feature_sizes[0]])
 
-    encoder_cells = []
-    for feature_size in self._feature_sizes:
-      encoder_cells += [
-          snt.LSTM(feature_size, use_layer_norm=self._use_layer_norm)
-      ]
-    encoder_cell = snt.DeepRNN(encoder_cells)
-    initial_state = encoder_cell.initial_state(batch_size)
+    initial_state = self.encoder_cell.initial_state(batch_size)
 
-    hidden_states, _ = tf.nn.dynamic_rnn(
-        cell=encoder_cell,
-        inputs=lstm_inputs,
+    # TF2/Sonnet2 requires time-step major, so permute axes
+    lstm_inputs = tf.transpose(lstm_inputs, perm=[1, 0, 2])
+    hidden_states, _ = snt.dynamic_unroll(
+        core=self.encoder_cell,
+        input_sequence=lstm_inputs,
         sequence_length=sequence_length,
         initial_state=initial_state,
         swap_memory=True)
 
+    # Then permute back
+    hidden_states = tf.transpose(hidden_states, perm=[1, 0, 2])
     hidden_states.shape.assert_is_compatible_with(
         [batch_size, max_sequence_length,
          sum(self._feature_sizes)])
-    logits = snt.BatchApply(snt.Linear(1))(hidden_states)
+    logits = self.batch_final(hidden_states)
     logits.shape.assert_is_compatible_with([batch_size, max_sequence_length, 1])
     logits_flat = tf.reshape(logits, [batch_size, max_sequence_length])
 
@@ -118,4 +168,5 @@ class LSTMEmbedDiscNet(snt.AbstractModule):
     # timesteps, including the ones that should be masked.
     mask = utils.get_mask_past_symbol(sequence, self._pad_token)
     masked_logits_flat = logits_flat * tf.cast(mask, tf.float32)
+
     return masked_logits_flat

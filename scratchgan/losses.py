@@ -18,8 +18,7 @@ from __future__ import division
 from __future__ import print_function
 
 import numpy as np
-import tensorflow.compat.v1 as tf
-
+import tensorflow as tf
 
 def sequential_cross_entropy_loss(logits, expected):
   """The cross entropy loss for binary classification.
@@ -42,8 +41,7 @@ def sequential_cross_entropy_loss(logits, expected):
   ce = tf.nn.sigmoid_cross_entropy_with_logits(labels=expected, logits=logits)
   return tf.reshape(ce, [batch_size, sequence_length])
 
-
-def reinforce_loss(disc_logits, gen_logprobs, gamma, decay):
+def reinforce_loss(disc_logits, gen_logprobs, gamma, decay, ewma_reward=0):
   """The REINFORCE loss.
 
   Args:
@@ -51,20 +49,21 @@ def reinforce_loss(disc_logits, gen_logprobs, gamma, decay):
       gen_logprobs: float32 tensor, shape [batch_size, sequence_length]
       gamma: a float, discount factor for cumulative reward.
       decay: a float, decay rate for the EWMA baseline of REINFORCE.
+      ewma_reward: the current EWMA baseline of REINFORCE
 
   Returns:
     Float tensor, shape [batch_size, sequence_length], the REINFORCE loss for
     each timestep.
+    Cumulative rewards, and current baseline.
   """
   # Assume 1 logit for each timestep.
   batch_size, sequence_length = disc_logits.shape.as_list()
   gen_logprobs.shape.assert_is_compatible_with([batch_size, sequence_length])
 
   disc_predictions = tf.nn.sigmoid(disc_logits)
-
   # MaskGAN uses log(D), but this is more stable empirically.
   rewards = 2.0 * disc_predictions - 1
-
+  
   # Compute cumulative rewards.
   rewards_list = tf.unstack(rewards, axis=1)
   cumulative_rewards = []
@@ -74,21 +73,16 @@ def reinforce_loss(disc_logits, gen_logprobs, gamma, decay):
       cum_value += np.power(gamma, (s - t)) * rewards_list[s]
     cumulative_rewards.append(cum_value)
   cumulative_rewards = tf.stack(cumulative_rewards, axis=1)
-
   cumulative_rewards.shape.assert_is_compatible_with(
       [batch_size, sequence_length])
 
-  with tf.variable_scope("reinforce", reuse=tf.AUTO_REUSE):
-    ewma_reward = tf.get_variable("ewma_reward", initializer=0.0)
-
   mean_reward = tf.reduce_mean(cumulative_rewards)
   new_ewma_reward = decay * ewma_reward + (1.0 - decay) * mean_reward
-  update_op = tf.assign(ewma_reward, new_ewma_reward)
+  ewma_reward = new_ewma_reward
 
   # REINFORCE
-  with tf.control_dependencies([update_op]):
-    advantage = cumulative_rewards - ewma_reward
-    loss = -tf.stop_gradient(advantage) * gen_logprobs
+  advantage = cumulative_rewards - ewma_reward
+  loss = -tf.stop_gradient(advantage) * gen_logprobs
 
   loss.shape.assert_is_compatible_with([batch_size, sequence_length])
   return loss, cumulative_rewards, ewma_reward

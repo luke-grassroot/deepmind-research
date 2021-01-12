@@ -18,19 +18,21 @@ from __future__ import division
 from __future__ import print_function
 import os
 import time
+import datetime
 
 from absl import app
 from absl import flags
 from absl import logging
 import numpy as np
-import tensorflow.compat.v1 as tf
+import tensorflow as tf
 from tensorflow.compat.v1.io import gfile
-from scratchgan import discriminator_nets
-from scratchgan import eval_metrics
-from scratchgan import generators
-from scratchgan import losses
-from scratchgan import reader
-from scratchgan import utils
+
+import discriminator_nets
+import eval_metrics
+import generators
+import losses
+import reader
+import utils
 
 flags.DEFINE_string("dataset", "emnlp2017", "Dataset.")
 flags.DEFINE_integer("batch_size", 512, "Batch size")
@@ -102,8 +104,7 @@ def main(_):
 def train(config):
   """Train."""
   logging.info("Training.")
-
-  tf.reset_default_graph()
+  
   np.set_printoptions(precision=4)
 
   # Get data.
@@ -119,12 +120,6 @@ def train(config):
   iterator_valid = reader.iterator(
       raw_data=valid_data, batch_size=config.batch_size)
 
-  real_sequence = tf.placeholder(
-      dtype=tf.int32,
-      shape=[config.batch_size, max_length],
-      name="real_sequence")
-  real_sequence_length = tf.placeholder(
-      dtype=tf.int32, shape=[config.batch_size], name="real_sequence_length")
   first_batch_np = next(iterator)
   valid_batch_np = next(iterator_valid)
 
@@ -153,7 +148,7 @@ def train(config):
   else:
     embedding_source = None
     vocab_file = None
-
+    
   gen = generators.LSTMGen(
       vocab_size=vocab_size,
       feature_sizes=[config.gen_feature_size] * config.num_layers_gen,
@@ -167,7 +162,6 @@ def train(config):
       embedding_source=embedding_source,
       vocab_file=vocab_file,
   )
-  gen_outputs = gen()
 
   # Create discriminator.
   disc = discriminator_nets.LSTMEmbedDiscNet(
@@ -180,124 +174,172 @@ def train(config):
       vocab_file=vocab_file,
       dropout=config.disc_dropout,
   )
-  disc_logits_real = disc(
-      sequence=real_sequence, sequence_length=real_sequence_length)
-  disc_logits_fake = disc(
-      sequence=gen_outputs["sequence"],
-      sequence_length=gen_outputs["sequence_length"])
 
-  # Loss of the discriminator.
-  if config.disc_loss_type == "ce":
-    targets_real = tf.ones(
-        [config.batch_size, reader.MAX_TOKENS_SEQUENCE[config.dataset]])
-    targets_fake = tf.zeros(
-        [config.batch_size, reader.MAX_TOKENS_SEQUENCE[config.dataset]])
-    loss_real = losses.sequential_cross_entropy_loss(disc_logits_real,
-                                                     targets_real)
-    loss_fake = losses.sequential_cross_entropy_loss(disc_logits_fake,
-                                                     targets_fake)
-    disc_loss = 0.5 * loss_real + 0.5 * loss_fake
+  # Optimizers        
+  disc_optimizer = tf.keras.optimizers.Adam(
+      learning_rate=config.disc_lr, beta_1=config.disc_beta1)
 
-  # Loss of the generator.
-  gen_loss, cumulative_rewards, baseline = losses.reinforce_loss(
-      disc_logits=disc_logits_fake,
-      gen_logprobs=gen_outputs["logprobs"],
-      gamma=config.gamma,
-      decay=config.baseline_decay)
+  gen_optimizer = tf.keras.optimizers.Adam(
+      learning_rate=config.gen_lr, beta_1=config.gen_beta1)
 
-  # Optimizers
-  disc_optimizer = tf.train.AdamOptimizer(
-      learning_rate=config.disc_lr, beta1=config.disc_beta1)
-  gen_optimizer = tf.train.AdamOptimizer(
-      learning_rate=config.gen_lr, beta1=config.gen_beta1)
+  # Training steps
+  @tf.function
+  def update_disc(real_data, gen_outputs, writer=None, step=0):        
+    with tf.GradientTape() as tape:
+      disc_logits_real = disc(sequence=real_data["sequence"], sequence_length=real_data["sequence_length"])
+      disc_logits_fake = disc(
+          sequence=gen_outputs["sequence"],
+          sequence_length=gen_outputs["sequence_length"])
 
-  # Get losses and variables.
-  disc_vars = disc.get_all_variables()
-  gen_vars = gen.get_all_variables()
-  l2_disc = tf.reduce_sum(tf.add_n([tf.nn.l2_loss(v) for v in disc_vars]))
-  l2_gen = tf.reduce_sum(tf.add_n([tf.nn.l2_loss(v) for v in gen_vars]))
-  scalar_disc_loss = tf.reduce_mean(disc_loss) + config.l2_disc * l2_disc
-  scalar_gen_loss = tf.reduce_mean(gen_loss) + config.l2_gen * l2_gen
+      # Loss of the discriminator.
+      if config.disc_loss_type == "ce":
+        targets_real = tf.ones(
+            [config.batch_size, reader.MAX_TOKENS_SEQUENCE[config.dataset]])
+        targets_fake = tf.zeros(
+            [config.batch_size, reader.MAX_TOKENS_SEQUENCE[config.dataset]])
+        loss_real = losses.sequential_cross_entropy_loss(disc_logits_real,
+                                                        targets_real)
+        loss_fake = losses.sequential_cross_entropy_loss(disc_logits_fake,
+                                                        targets_fake)
+        disc_loss = 0.5 * loss_real + 0.5 * loss_fake
+      
+      disc_vars = disc.trainable_variables
+      l2_disc = tf.reduce_sum(tf.add_n([tf.nn.l2_loss(v) for v in disc_vars]))
+      scalar_disc_loss = tf.reduce_mean(disc_loss) + config.l2_disc * l2_disc
 
-  # Update ops.
-  global_step = tf.train.get_or_create_global_step()
-  disc_update = disc_optimizer.minimize(
-      scalar_disc_loss, var_list=disc_vars, global_step=global_step)
-  gen_update = gen_optimizer.minimize(
-      scalar_gen_loss, var_list=gen_vars, global_step=global_step)
+      grads = tape.gradient(scalar_disc_loss, disc_vars)
+      disc_optimizer.apply_gradients(zip(grads, disc_vars))
+
+    if writer:
+      utils.log_gradients(writer, disc_vars, grads, step)
+    
+    return scalar_disc_loss, disc_logits_fake, disc_logits_real
+
+  @tf.function
+  def update_gen(writer=None, step=0, baseline=0):
+    with tf.GradientTape() as tape:
+      gen_outputs = gen(writer=writer, step=step)
+      disc_logits_fake = disc(sequence=gen_outputs["sequence"], sequence_length=gen_outputs["sequence_length"])
+
+      # Loss of the generator.
+      gen_loss, cumulative_rewards, baseline = losses.reinforce_loss(
+          disc_logits=disc_logits_fake,
+          gen_logprobs=gen_outputs["logprobs"],
+          gamma=config.gamma,
+          decay=config.baseline_decay,
+          ewma_reward=baseline)
+    
+      # Get losses and variables.
+      gen_vars = gen.trainable_variables
+      l2_gen = tf.reduce_sum(tf.add_n([tf.nn.l2_loss(v) for v in gen_vars]))
+      scalar_gen_loss = tf.reduce_mean(gen_loss) + config.l2_gen * l2_gen
+
+      # Update ops.
+      grads = tape.gradient(scalar_gen_loss, gen_vars)
+      gen_optimizer.apply_gradients(zip(grads, gen_vars))
+      
+    if writer:
+      utils.log_gradients(writer, gen_vars, grads, step)
+      with writer.as_default():
+        tf.summary.histogram('loss/generator', gen_loss, step)
+    
+    return scalar_gen_loss, cumulative_rewards, baseline
+
+  @tf.function
+  def update_metrics(train_feed, writer, step=0):
+    gen_outputs = gen()
+    tf.summary.trace_on(graph=True, profiler=False)
+    scalar_disc_loss, disc_logits_real, disc_logits_fake = update_disc(train_feed, gen_outputs)
+    with writer.as_default():
+      tf.summary.trace_export(name="update_disc", step=step)
+    
+    tf.summary.trace_on(graph=True, profiler=False)
+    scalar_gen_loss, cumulative_rewards, baseline = update_gen(writer)
+    with writer.as_default():
+      tf.summary.trace_export(name="update_gen", step=step)
+
+    test_disc_logits_real = disc(**test_real_batch)
+    test_disc_logits_fake = disc(**test_fake_batch)
+    valid_disc_logits = disc(**valid_batch)
+    disc_predictions_real = tf.nn.sigmoid(disc_logits_real)
+    disc_predictions_fake = tf.nn.sigmoid(disc_logits_fake)
+    valid_disc_predictions = tf.reduce_mean(
+        tf.nn.sigmoid(valid_disc_logits), axis=0)
+    test_disc_predictions_real = tf.reduce_mean(
+        tf.nn.sigmoid(test_disc_logits_real), axis=0)
+    test_disc_predictions_fake = tf.reduce_mean(
+        tf.nn.sigmoid(test_disc_logits_fake), axis=0)
+
+    # Only log results for the first element of the batch.
+    metrics = {
+        "scalar_gen_loss": scalar_gen_loss,
+        "scalar_disc_loss": scalar_disc_loss,
+        "disc_predictions_real": tf.reduce_mean(disc_predictions_real),
+        "disc_predictions_fake": tf.reduce_mean(disc_predictions_fake),
+        "test_disc_predictions_real": tf.reduce_mean(test_disc_predictions_real),
+        "test_disc_predictions_fake": tf.reduce_mean(test_disc_predictions_fake),
+        "valid_disc_predictions": tf.reduce_mean(valid_disc_predictions),
+        "cumulative_rewards": tf.reduce_mean(cumulative_rewards),
+        "baseline": tf.reduce_mean(baseline),
+    }
+
+    gen_sequence_np = gen_outputs["sequence"]
+    metrics["gen_sentence"] = utils.sequence_to_sentence(gen_sequence_np[0, :], id_to_word)
+    return metrics
 
   # Saver.
-  saver = tf.train.Saver()
+  global_step = tf.Variable(1, name="global_step")
+  ckpt = tf.train.Checkpoint(step=global_step)
+  manager = tf.train.CheckpointManager(ckpt, config.checkpoint_dir + "scratchgan", max_to_keep=3)
 
-  # Metrics
-  test_disc_logits_real = disc(**test_real_batch)
-  test_disc_logits_fake = disc(**test_fake_batch)
-  valid_disc_logits = disc(**valid_batch)
-  disc_predictions_real = tf.nn.sigmoid(disc_logits_real)
-  disc_predictions_fake = tf.nn.sigmoid(disc_logits_fake)
-  valid_disc_predictions = tf.reduce_mean(
-      tf.nn.sigmoid(valid_disc_logits), axis=0)
-  test_disc_predictions_real = tf.reduce_mean(
-      tf.nn.sigmoid(test_disc_logits_real), axis=0)
-  test_disc_predictions_fake = tf.reduce_mean(
-      tf.nn.sigmoid(test_disc_logits_fake), axis=0)
-
-  # Only log results for the first element of the batch.
-  metrics = {
-      "scalar_gen_loss": scalar_gen_loss,
-      "scalar_disc_loss": scalar_disc_loss,
-      "disc_predictions_real": tf.reduce_mean(disc_predictions_real),
-      "disc_predictions_fake": tf.reduce_mean(disc_predictions_fake),
-      "test_disc_predictions_real": tf.reduce_mean(test_disc_predictions_real),
-      "test_disc_predictions_fake": tf.reduce_mean(test_disc_predictions_fake),
-      "valid_disc_predictions": tf.reduce_mean(valid_disc_predictions),
-      "cumulative_rewards": tf.reduce_mean(cumulative_rewards),
-      "baseline": tf.reduce_mean(baseline),
-  }
+  # Tensorboard
+  current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+  tfb_log = f'logs/gradient_tape/{current_time}'
+  writer = tf.summary.create_file_writer(tfb_log)
 
   # Training.
   logging.info("Starting training")
-  with tf.Session() as sess:
+  
+  latest_ckpt = manager.latest_checkpoint
+  if latest_ckpt:
+    ckpt.restore(manager.latest_checkpoint)
 
-    sess.run(tf.global_variables_initializer())
-    latest_ckpt = tf.train.latest_checkpoint(config.checkpoint_dir)
-    if latest_ckpt:
-      saver.restore(sess, latest_ckpt)
+  # TF2 has no global variables so need to keep track of baseline for gen REINFORCE ourselves
+  baseline = 0
 
-    for step in range(config.num_steps):
-      real_data_np = next(iterator)
-      train_feed = {
-          real_sequence: real_data_np["sequence"],
-          real_sequence_length: real_data_np["sequence_length"],
-      }
+  for step in range(config.num_steps):
+    real_data_np = next(iterator)
+    train_feed = {
+        'sequence': real_data_np["sequence"],
+        'sequence_length': real_data_np["sequence_length"],
+    }
 
-      # Update generator and discriminator.
-      for _ in range(config.num_disc_updates):
-        sess.run(disc_update, feed_dict=train_feed)
-      for _ in range(config.num_gen_updates):
-        sess.run(gen_update, feed_dict=train_feed)
+    # Update generator and discriminator.
+    for _ in range(config.num_disc_updates):
+        gen_outputs = gen()
+        scalar_disc_loss, _, _ = update_disc(train_feed, gen_outputs)
+        with writer.as_default():
+          tf.summary.scalar('disc_loss', scalar_disc_loss, step=step)
 
-      # Reporting
-      if step % config.export_every == 0:
-        gen_sequence_np, metrics_np = sess.run(
-            [gen_outputs["sequence"], metrics], feed_dict=train_feed)
-        metrics_np["gen_sentence"] = utils.sequence_to_sentence(
-            gen_sequence_np[0, :], id_to_word)
-        saver.save(
-            sess,
-            save_path=config.checkpoint_dir + "scratchgan",
-            global_step=global_step)
-        metrics_np["model_path"] = tf.train.latest_checkpoint(
-            config.checkpoint_dir)
-        logging.info(metrics_np)
+    for _ in range(config.num_gen_updates):
+      scalar_gen_loss, _, baseline = update_gen(writer, step, baseline)
+      with writer.as_default():
+        tf.summary.scalar('gen_loss', scalar_gen_loss, step=step)
+        tf.summary.scalar('baseline', baseline, step=step)
 
-    # After training, export models.
-    saver.save(
-        sess,
-        save_path=config.checkpoint_dir + "scratchgan",
-        global_step=global_step)
-    logging.info("Saved final model at %s.",
-                 tf.train.latest_checkpoint(config.checkpoint_dir))
+    # Reporting
+    ckpt.step.assign_add(1)
+    if step % config.export_every == 0:
+      metrics_np = update_metrics(train_feed, writer, step)
+      manager.save()
+      metrics_np["model_path"] = tf.train.latest_checkpoint(
+          config.checkpoint_dir)
+      logging.info(metrics_np)
+
+  # After training, export models.
+  manager.save()
+  logging.info("Saved final model at %s.",
+                tf.train.latest_checkpoint(config.checkpoint_dir))
 
 
 def evaluate_pair(config, batch_size, checkpoint_path, data_dir, dataset,
@@ -320,7 +362,6 @@ def evaluate_pair(config, batch_size, checkpoint_path, data_dir, dataset,
     dataset: string, "emnlp2017", to select the right dataset.
     num_examples_for_eval: int, number of examples for evaluation.
   """
-  tf.reset_default_graph()
   logging.info("Evaluating checkpoint %s.", checkpoint_path)
 
   # Build graph.
